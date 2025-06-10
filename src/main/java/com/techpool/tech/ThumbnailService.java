@@ -2,6 +2,8 @@ package com.techpool.tech;
 
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
+import fr.opensagres.poi.xwpf.converter.pdf.PdfConverter;
+import fr.opensagres.poi.xwpf.converter.pdf.PdfOptions;
 import org.apache.tika.Tika;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -10,16 +12,19 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.poi.hwpf.HWPFDocument;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.usermodel.WorkbookFactory;
-
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import javax.imageio.ImageIO;
 import com.opencsv.CSVReader;
 import java.awt.*;
 import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileReader;
@@ -74,15 +79,6 @@ public class ThumbnailService {
         }
     }
 
-    private void validateFilePath(File file) throws IOException {
-        Path path = file.toPath().toAbsolutePath().normalize();
-        Path allowedBase = Paths.get(System.getProperty("user.home")).toAbsolutePath();
-
-        if (!path.startsWith(allowedBase)) {
-            throw new IOException("Access denied to path: " + path);
-        }
-    }
-
     // Add validation method
     private void validateFileSize(File file) throws IOException {
         if (file.length() > MAX_FILE_SIZE_BYTES) {
@@ -130,6 +126,10 @@ public class ThumbnailService {
                 logger.error("Failed to generate default thumbnail for {}", file.getName(), ex);
             }
         }
+    }
+
+    private String detectMimeType(File file) throws IOException {
+        return new Tika().detect(file);
     }
 
     private boolean isSupportedDocument(String mimeType) {
@@ -198,6 +198,19 @@ public class ThumbnailService {
         }
     }
 
+    private Path getThumbnailPath(File originalFile, String extension) {
+        // Get filename without extension
+        String baseName = originalFile.getName();
+        baseName = baseName.replaceAll("[^a-zA-Z0-9.-]", "_");
+        int dotIndex = baseName.lastIndexOf('.');
+        if (dotIndex > 0) {
+            baseName = baseName.substring(0, dotIndex);
+        }
+        // Construct thumbnail name
+        String thumbName = THUMBNAIL_PREFIX + baseName + "." + extension;
+        return Paths.get(originalFile.getParent(), thumbName);
+    }
+
     private void generatePdfThumbnail(File pdfFile) throws IOException {
         try (PDDocument document = PDDocument.load(pdfFile)) {
             if (document.isEncrypted()) {
@@ -230,65 +243,86 @@ public class ThumbnailService {
         return text.length() > 200 ? text.substring(0, 200) + "..." : text;
     }
 
-    private void generateDocumentThumbnail(File documentFile, String mimeType)
-            throws IOException, InterruptedException {
-        // First convert to PDF
-        File pdfFile = convertToPdf(documentFile);
+    private void generateDocumentThumbnail(File documentFile, String mimeType) throws IOException {
+        try {
+            BufferedImage image;
 
-        if (pdfFile != null && pdfFile.exists()) {
-            // Then generate thumbnail from PDF
-            generatePdfThumbnail(pdfFile);
-
-            // Clean up temporary PDF file
-            if (!pdfFile.delete()) {
-                logger.info("Warning: Could not delete temporary PDF file: ",
-                        pdfFile.getAbsolutePath());
+            if (mimeType.equals(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document")) {
+                image = renderDocxToImage(documentFile);
+            } else if (mimeType.equals("application/msword")) {
+                image = renderDocToImage(documentFile);
+            } else {
+                throw new IOException("Unsupported document type: " + mimeType);
             }
-        } else {
-            throw new IOException("Failed to convert document to PDF: " + documentFile.getName());
+
+            saveThumbnail(image, documentFile, "jpg");
+        } catch (Exception e) {
+            logger.warn("Document rendering failed, falling back to text preview", e);
+            generateTextPreviewThumbnail(documentFile,
+                    extractTextFromDocument(documentFile, mimeType));
         }
     }
 
-    private File convertToPdf(File inputFile) throws IOException, InterruptedException {
-        String sofficeCommand = getLibreOfficeCommand();
-        File outputDir = inputFile.getParentFile();
-        String outputPath = outputDir.getAbsolutePath();
+    private BufferedImage renderDocxToImage(File docxFile) throws IOException {
+        try (XWPFDocument doc = new XWPFDocument(Files.newInputStream(docxFile.toPath()))) {
+            // Create PDF in memory
+            ByteArrayOutputStream pdfOut = new ByteArrayOutputStream();
+            PdfOptions options = PdfOptions.create();
+            PdfConverter.getInstance().convert(doc, pdfOut, options);
 
-        ProcessBuilder pb = new ProcessBuilder(sofficeCommand, "--headless", "--convert-to", "pdf",
-                "--outdir", outputPath, inputFile.getAbsolutePath());
-
-        Process process = pb.start();
-        int exitCode = process.waitFor();
-
-        if (exitCode != 0) {
-            throw new IOException("LibreOffice conversion failed with exit code " + exitCode);
-        }
-
-        // Find the converted PDF file
-        String pdfFilename = inputFile.getName().replaceFirst("\\.[^.]+$", "") + ".pdf";
-        File pdfFile = new File(outputDir, pdfFilename);
-
-        return pdfFile.exists() ? pdfFile : null;
-    }
-
-    private String getLibreOfficeCommand() {
-        String os = System.getProperty("os.name").toLowerCase();
-
-        if (os.contains("win")) {
-            // Check common Windows installation paths
-            String[] possiblePaths = {"C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-                    "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe"};
-
-            for (String path : possiblePaths) {
-                File sofficeFile = new File(path);
-                if (sofficeFile.exists()) {
-                    return path;
-                }
+            // Render first page of PDF to image
+            try (PDDocument pdfDoc = PDDocument.load(pdfOut.toByteArray())) {
+                PDFRenderer renderer = new PDFRenderer(pdfDoc);
+                return renderer.renderImageWithDPI(0, 150);
             }
         }
+    }
 
-        // Default to just 'soffice' (should be in PATH)
-        return "soffice";
+    private BufferedImage renderDocToImage(File docFile) throws IOException {
+        try (HWPFDocument doc = new HWPFDocument(Files.newInputStream(docFile.toPath()))) {
+            // Extract text and create simple preview
+            String text = doc.getDocumentText();
+            return createTextImage("DOC Preview", text);
+        }
+    }
+
+    private String extractTextFromDocument(File file, String mimeType) throws IOException {
+        if (mimeType.equals(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document")) {
+            try (XWPFDocument doc = new XWPFDocument(Files.newInputStream(file.toPath()))) {
+                return doc.getParagraphs().stream().map(XWPFParagraph::getText)
+                        .collect(Collectors.joining("\n"));
+            }
+        } else if (mimeType.equals("application/msword")) {
+            try (HWPFDocument doc = new HWPFDocument(Files.newInputStream(file.toPath()))) {
+                return doc.getDocumentText();
+            }
+        }
+        return "No text extracted";
+    }
+
+    private BufferedImage createTextImage(String title, String content) {
+        BufferedImage image =
+                new BufferedImage(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = image.createGraphics();
+
+        // Setup background
+        g.setColor(Color.WHITE);
+        g.fillRect(0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
+
+        // Draw title
+        g.setColor(Color.BLUE);
+        g.setFont(new Font("Arial", Font.BOLD, 14));
+        g.drawString(title, 10, 20);
+
+        // Draw content
+        g.setColor(Color.BLACK);
+        g.setFont(new Font("Arial", Font.PLAIN, 12));
+        drawWrappedText(g, content, 10, 40, THUMBNAIL_WIDTH - 20);
+
+        g.dispose();
+        return image;
     }
 
     private void generateTextPreviewThumbnail(File originalFile, String text) throws IOException {
@@ -340,7 +374,7 @@ public class ThumbnailService {
             if (file.getName().toLowerCase().endsWith(".csv")) {
                 previewLines = readCsvPreview(file, 3);
             } else {
-                previewLines = readExcelPreview(file, 3); // You'll need to implement this
+                previewLines = readExcelPreview(file, 3);
             }
             BufferedImage image = createDataPreviewImage(file.getName(), previewLines);
             saveThumbnail(image, file, "jpg");
@@ -394,11 +428,6 @@ public class ThumbnailService {
         return cleanCsvLine(sb.toString());
     }
 
-    // private String truncateLine(String line) {
-    // return line.length() > 50 ? line.substring(0, 47) + "..." : line;
-    // }
-
-    // Update CSV reading:
     private List<String> readCsvPreview(File csvFile, int maxLines)
             throws IOException, com.opencsv.exceptions.CsvValidationException {
         List<String> lines = new ArrayList<>();
@@ -478,7 +507,7 @@ public class ThumbnailService {
             return filename.substring(0, 17) + "...";
         }
         return filename;
-    } 
+    }
 
     private void generateDefaultThumbnail(File file) throws IOException {
         // Create an image with file icon and name
@@ -526,16 +555,6 @@ public class ThumbnailService {
         saveThumbnail(image, file, "jpg");
     }
 
-    private Path getThumbnailPath(File originalFile, String extension) {
-        String thumbName = THUMBNAIL_PREFIX + originalFile.getName() + "." + extension;
-        return Paths.get(originalFile.getParent(), thumbName);
-    }
-
-    // private void saveThumbnail(BufferedImage image, File originalFile, String format)
-    // throws IOException {
-    // Path outputPath = getThumbnailPath(originalFile, format);
-    // ImageIO.write(image, format, outputPath.toFile());
-    // }
     private void saveThumbnail(BufferedImage image, File originalFile, String format)
             throws IOException {
         Path outputPath = getThumbnailPath(originalFile, format);
@@ -568,7 +587,4 @@ public class ThumbnailService {
         }
     }
 
-    private String detectMimeType(File file) throws IOException {
-        return new Tika().detect(file);
-    }
 }
