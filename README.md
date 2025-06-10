@@ -11,7 +11,6 @@ Ensure the following are installed:
 - Java 8+ (JDK)
 - Maven
 - FFmpeg (for video thumbnails)
-- LibreOffice (for document conversion)
 - GitHub account
 
 ---
