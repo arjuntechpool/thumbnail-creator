@@ -43,7 +43,7 @@ public class ThumbnailService {
 
     // Constants for thumbnail generation
     private static final int THUMBNAIL_WIDTH = 400;
-    private static final int THUMBNAIL_HEIGHT = 400;
+    private static final int THUMBNAIL_HEIGHT = 600;
     private static final String THUMBNAIL_PREFIX = "thumb_";
     private static final String DEFAULT_THUMBNAIL_TEXT = "No Preview\nAvailable";
     private static final long MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
